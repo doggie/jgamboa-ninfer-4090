@@ -150,56 +150,6 @@ std::string response_request_id(const httplib::Response& response) {
     return {};
 }
 
-// Query-string helpers for /debug/cache. This httplib build exposes Request::query as the raw,
-// still percent-encoded string (no leading '?') with no built-in parser, so split, parse and
-// decode it by hand.
-int hex_digit_value(char c) noexcept {
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-    return -1;
-}
-
-std::string url_decode_component(std::string_view component) {
-    std::string out;
-    out.reserve(component.size());
-    for (std::size_t i = 0; i < component.size(); ++i) {
-        const char c = static_cast<char>(component[i]);
-        if (c == '%' && i + 2 < component.size()) {
-            const int hi = hex_digit_value(static_cast<char>(component[i + 1]));
-            const int lo = hex_digit_value(static_cast<char>(component[i + 2]));
-            if (hi >= 0 && lo >= 0) {
-                out += static_cast<char>(static_cast<unsigned char>(hi) << 4 |
-                                         static_cast<unsigned char>(lo));
-                i += 2;
-                continue;
-            }
-        }
-        if (c == '+') {
-            out += ' ';
-        } else {
-            out += c;
-        }
-    }
-    return out;
-}
-
-std::optional<std::string> get_query_value(std::string_view query, std::string_view key) {
-    std::string_view remaining = query;
-    while (true) {
-        const std::size_t amp = remaining.find('&');
-        const std::string_view pair =
-            (amp == std::string_view::npos) ? remaining : remaining.substr(0, amp);
-        const std::size_t eq = pair.find('=');
-        if (eq != std::string_view::npos && pair.substr(0, eq) == key) {
-            return url_decode_component(pair.substr(eq + 1));
-        }
-        if (amp == std::string_view::npos) {
-            return {};
-        }
-        remaining = remaining.substr(amp + 1);
-    }
-}
 
 // Curated read-only slice of RuntimeStats relevant to the continuation/cache state.
 nlohmann::json make_cache_stats_json(const ninfer::RuntimeStats& stats) {
@@ -628,11 +578,13 @@ void HttpServer::register_routes() {
         }
 
         // Parse ?max_aliases: default 200, "full" or "0" => unlimited, positive int => that count.
+        // This fork's cpp-httplib decodes the query string into Request::params (no raw
+        // Request::query member), so read it via the standard accessors — same idiom as
+        // /slots and the /v1 responses routes.
         std::size_t alias_limit = 200;
         bool unlimited = false;
-        const auto max_aliases = get_query_value(req.query, "max_aliases");
-        if (max_aliases) {
-            const std::string value = *max_aliases;
+        if (req.has_param("max_aliases")) {
+            const std::string value = req.get_param_value("max_aliases");
             if (value == "full") {
                 unlimited = true;
             } else {
