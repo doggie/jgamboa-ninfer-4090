@@ -165,6 +165,8 @@ struct RequestRecord {
     Clock::time_point deadline;
     Clock::time_point submitted;
     std::optional<Clock::time_point> admitted_at;
+    // Anchor for in-flight prefill progress elapsed time (set once, before the first prefill unit).
+    std::optional<Clock::time_point> prefill_started;
     std::optional<Clock::time_point> first_token;
     std::optional<Clock::time_point> last_token;
     bool queue_wait_recorded = false;

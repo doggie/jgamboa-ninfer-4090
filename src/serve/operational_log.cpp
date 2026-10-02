@@ -228,8 +228,55 @@ OperationalRecord render_request_rejected(const RequestRejectionLogContext& cont
     return {.severity = failure_severity(failure.classification), .message = out.str()};
 }
 
+// llama.cpp-style per-request summary (mirrors llama-server common/sampling.cpp): prompt-eval,
+// eval, total time, and the confirmed cache-reuse figure (the measured counterpart of the
+// observer's `[planned]` line printed before prompt eval). Console-only under --llamacpplog;
+// the structured JSONL still records every field.
+OperationalRecord render_llamacpp_done(const RequestLogContext& context,
+                                       const GenerationOutcome& outcome) {
+    const GenerationMetrics& metrics    = outcome.metrics;
+    const int prompt_tokens             = outcome.prompt_tokens;
+    const int completion_runs           = outcome.completion_tokens;
+    const int computed_prefill          =
+        std::max(0, prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens));
+    const double prompt_eval_ms         = metrics.prefill_seconds * 1000.0;
+    const double prompt_eval_tok_ms     = computed_prefill > 0 ? prompt_eval_ms / computed_prefill : 0.0;
+    const double prompt_eval_tps        =
+        metrics.prefill_seconds > 0.0 ? static_cast<double>(computed_prefill) / metrics.prefill_seconds
+                                      : 0.0;
+    const double eval_ms                = metrics.decode_seconds * 1000.0;
+    const double eval_tok_ms            = completion_runs > 0 ? eval_ms / completion_runs : 0.0;
+    const double eval_tps               =
+        metrics.decode_seconds > 0.0 ? static_cast<double>(completion_runs) / metrics.decode_seconds
+                                     : 0.0;
+    const double cache_usage_pct        = prompt_tokens > 0
+                                         ? 100.0 * static_cast<double>(metrics.prefix_cache_hit_tokens) /
+                                                 static_cast<double>(prompt_tokens)
+                                         : 0.0;
+
+    std::ostringstream out;
+    // Console prefix shows the short request-id tail; the full value is in the JSONL.
+    const std::string prefix = "[req " + std::to_string(context.id) +
+                               " x_request_id=" + short_hash(context.x_request_id) + "] ";
+    const int total_tokens    = prompt_tokens + completion_runs;
+    const double total_ms     = (metrics.prefill_seconds + metrics.decode_seconds) * 1000.0;
+    out << prefix << "prompt eval time = " << std::fixed << std::setprecision(2) << std::setw(10)
+        << prompt_eval_ms << " ms / " << std::setw(5) << computed_prefill
+        << " tokens (" << std::setw(8) << prompt_eval_tok_ms << " ms per token, "
+        << std::setw(8) << prompt_eval_tps << " tokens per second)";
+    out << "\n" << prefix << "       eval time = " << std::setw(10) << eval_ms << " ms / "
+        << std::setw(5) << completion_runs << " tokens (" << std::setw(8) << eval_tok_ms
+        << " ms per token, " << std::setw(8) << eval_tps << " tokens per second)";
+    out << "\n" << prefix << "       total time = " << std::setw(10) << total_ms << " ms / "
+        << std::setw(5) << total_tokens << " tokens";
+    out << "\n" << prefix << "confirmed: reused " << metrics.prefix_cache_hit_tokens
+        << " tokens from cache (" << std::setw(5) << cache_usage_pct << "% of prompt)";
+    return {.severity = OperationalSeverity::Info, .message = out.str()};
+}
+
 OperationalRecord render_request_done(const RequestLogContext& context,
                                       const GenerationOutcome& outcome) {
+    if (context.llamacpp_log) { return render_llamacpp_done(context, outcome); }
     const GenerationMetrics& metrics     = outcome.metrics;
     const double computed_prefill_tokens = static_cast<double>(
         std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));

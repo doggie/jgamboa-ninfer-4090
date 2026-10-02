@@ -312,10 +312,30 @@ struct OutputOptions {
     std::uint32_t tool_name_max_length = 128;
 };
 
+// One in-flight progress sample, reported by the executor at a prefill unit or a decode round and
+// delivered to an optional per-request observer. `tokens` is the cumulative count for the phase:
+// for Prefill the prompt tokens processed so far, for Decode the tokens generated so far. The
+// observer is a best-effort, non-blocking hook (set only when the serve layer opts in, e.g.
+// --llamacpplog); it must never block or throw into the execution loop.
+struct ProgressEvent {
+    enum class Phase : std::uint8_t { Prefill, Decode, CachePlanned };
+    Phase phase                 = Phase::Prefill;
+    // For Prefill: prompt tokens processed so far. For Decode: tokens generated so far.
+    // For CachePlanned: the (planned) number of prompt tokens that will be reused from cache.
+    std::uint64_t tokens        = 0;
+    double phase_elapsed_seconds = 0.0;
+    // Only meaningful for CachePlanned: the tier the planned reuse comes from,
+    // "l1" (device-resident) / "l2" (host-RAM) / "l3" (disk) / "none" (cold).
+    std::string cache_tier      = "none";
+};
+
 struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    // Optional non-blocking in-flight progress observer. Empty by default, so a request that does
+    // not opt in pays nothing (no per-unit callback on the executor hot path).
+    std::function<void(const ProgressEvent&)> progress_sink;
 };
 
 enum class MediaKind : std::uint8_t {

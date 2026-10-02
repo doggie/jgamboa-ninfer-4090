@@ -24,6 +24,7 @@ namespace ninfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+class ProgressObserver;
 
 struct GenerationMetrics {
     double prepare_seconds         = 0.0;
@@ -166,11 +167,17 @@ public:
         return options.context_cache.max_private_continuations.value_or(options.max_concurrency);
     }
 
+    // The live-progress observer (Feature: --llamacpplog). When non-null, prepare() stamps its
+    // `set_prompt_total` before submit and installs it as the `RequestOptions::progress_sink`,
+    // so the Engine worker's per-unit prefill / decode / materialization events flow back to it
+    // from its own thread. `null` when --llamacpplog is off; a null observer costs nothing on
+    // the execution hot path.
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           GenerationConsumerMode consumer_mode,
                                           ninfer::GenerationObservationOptions observation = {},
                                           std::function<bool()> is_cancelled               = {},
-                                          ContextCacheHints context_cache = {}) const;
+                                          ContextCacheHints context_cache = {},
+                                          std::shared_ptr<ProgressObserver> progress       = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -195,7 +202,8 @@ private:
     prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
                  ninfer::GenerationObservationOptions observation,
                  std::function<bool()> is_cancelled, ContextCacheHints context_cache,
-                 CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
+                 CacheParticipation cache_participation, DeadlinePolicy deadline_policy,
+                 std::shared_ptr<ProgressObserver> progress) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 

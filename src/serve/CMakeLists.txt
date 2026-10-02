@@ -41,6 +41,7 @@ add_library(ninfer_serve STATIC
   translate.cpp
   generation_service.cpp
   request_events.cpp
+  console_log.cpp
   operational_log.cpp
   request_log.cpp
   http_server.cpp

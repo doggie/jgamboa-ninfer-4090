@@ -3,6 +3,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
+#include "serve/serve_progress.h"
 
 #include <atomic>
 #include <cstddef>
@@ -38,6 +39,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
+    std::shared_ptr<ProgressObserver> progress =
+        options_.llamacpp_log ? std::make_shared<ProgressObserver>() : nullptr;
     PreparedRequest prepared;
     try {
         const ninfer::GenerationObservationOptions observation{
@@ -45,10 +48,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             .live_timings    = request.stream && request.timings_per_token,
             .prompt_progress = request.stream && request.return_progress,
         };
-        prepared = service_->prepare(request.generation,
-                                     request.stream ? GenerationConsumerMode::Streaming
-                                                    : GenerationConsumerMode::Aggregate,
-                                     observation, [&req] { return client_disconnected(req); });
+        prepared = service_->prepare(
+            request.generation,
+            request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
+            observation, [&req] { return client_disconnected(req); }, ContextCacheHints{}, progress);
     } catch (const ApiException& exception) {
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, exception.error()));
@@ -65,9 +68,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
+    std::string x_request_id = req.get_header_value("x-request-id");
+    if (x_request_id.empty()) { x_request_id = "req_" + std::to_string(req_id); }
+    if (progress) {
+        progress->set_identity(req_id, x_request_id);
+    }
+
     const OpenAIChatResponseIdentity identity = make_openai_chat_response_identity(request.model);
-    auto lifecycle                            = begin_request(make_request_log_context(
-        req_id, "openai_chat_completions", request.generation, metadata, prepared));
+    auto lifecycle = begin_request(make_request_log_context(
+        req_id, x_request_id, "openai_chat_completions", request.generation, metadata, prepared,
+        options_.llamacpp_log));
 
     if (!request.stream) {
         GenerationOutcome outcome;

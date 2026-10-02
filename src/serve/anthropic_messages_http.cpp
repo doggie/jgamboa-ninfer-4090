@@ -2,6 +2,7 @@
 
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
+#include "serve/serve_progress.h"
 
 #include <atomic>
 #include <cstddef>
@@ -63,12 +64,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
+    std::shared_ptr<ProgressObserver> progress =
+        options_.llamacpp_log ? std::make_shared<ProgressObserver>() : nullptr;
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(request.generation,
-                                     request.stream ? GenerationConsumerMode::Streaming
-                                                    : GenerationConsumerMode::Aggregate,
-                                     {}, [&req] { return client_disconnected(req); });
+        prepared = service_->prepare(
+            request.generation,
+            request.stream ? GenerationConsumerMode::Streaming
+                           : GenerationConsumerMode::Aggregate,
+            {}, [&req] { return client_disconnected(req); }, ContextCacheHints{}, progress);
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -86,12 +90,19 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
+    std::string x_request_id = req.get_header_value("x-request-id");
+    if (x_request_id.empty()) { x_request_id = request_id; }
+    if (progress) {
+        progress->set_identity(req_id, x_request_id);
+    }
+
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity(request_id, request.model);
     const int input_tokens = prepared.prompt_tokens;
 
     auto lifecycle = begin_request(make_request_log_context(
-        req_id, "anthropic_messages", request.generation, metadata, prepared));
+        req_id, x_request_id, "anthropic_messages", request.generation, metadata, prepared,
+        options_.llamacpp_log));
 
     if (!request.stream) {
         GenerationOutcome outcome;

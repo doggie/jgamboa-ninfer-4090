@@ -2,6 +2,7 @@
 
 #include "product/media_acquire/acquire.h"
 #include <spdlog/logger.h>
+#include "serve/serve_progress.h"
 #include "serve/translate.h"
 
 #include <algorithm>
@@ -311,11 +312,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            GenerationConsumerMode consumer_mode,
                                            ninfer::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled,
-                                           ContextCacheHints context_cache) const {
+                                           ContextCacheHints context_cache,
+                                           std::shared_ptr<ProgressObserver> progress) const {
     return prepare_impl(
         request, consumer_mode, observation, std::move(is_cancelled), std::move(context_cache),
         options_.allow_prefix_reuse ? CacheParticipation::ReadWrite : CacheParticipation::Disabled,
-        DeadlinePolicy::ClientPendingTimeout);
+        DeadlinePolicy::ClientPendingTimeout, std::move(progress));
 }
 
 PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
@@ -324,7 +326,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 std::function<bool()> is_cancelled,
                                                 ContextCacheHints context_cache,
                                                 CacheParticipation cache_participation,
-                                                DeadlinePolicy deadline_policy) const {
+                                                DeadlinePolicy deadline_policy,
+                                                std::shared_ptr<ProgressObserver> progress) const {
     PreparedRequest prepared;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
@@ -381,6 +384,12 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        if (progress) {
+            progress->set_prompt_total(static_cast<std::uint64_t>(prepared.prompt_tokens));
+            request_options.progress_sink = [progress](const ninfer::ProgressEvent& event) {
+                progress->on_event(event);
+            };
+        }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               consumer_mode == GenerationConsumerMode::Streaming
                                                   ? ninfer::OutputConsumerMode::Streaming
@@ -504,7 +513,8 @@ void GenerationService::warmup() {
     request.max_tokens = 4;
     PreparedRequest prepared =
         prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
-                     CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
+                     CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup,
+                     std::shared_ptr<ProgressObserver>{});
     run(prepared, nullptr);
 }
 

@@ -28,6 +28,8 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    bool llamacpp_log            = false;         // --llamacpplog: console log llama.cpp-style
+                                                    // per-request lines and throttle throughput
     std::string slot_save_path;        // empty => /slots save/restore/erase disabled
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);

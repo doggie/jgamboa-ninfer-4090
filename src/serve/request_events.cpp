@@ -4,12 +4,14 @@
 
 namespace ninfer::serve {
 
-RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
-                                           const GenerationRequest& request,
+RequestLogContext make_request_log_context(std::uint64_t id, std::string x_request_id,
+                                           std::string protocol, const GenerationRequest& request,
                                            const RequestLogMetadata& metadata,
-                                           const PreparedRequest& prepared) {
+                                           const PreparedRequest& prepared, bool llamacpp_log) {
     RequestLogContext context;
     context.id                                 = id;
+    context.x_request_id                       = std::move(x_request_id);
+    context.llamacpp_log                       = llamacpp_log;
     context.protocol                           = std::move(protocol);
     context.model                              = metadata.model;
     context.stream                             = metadata.stream;

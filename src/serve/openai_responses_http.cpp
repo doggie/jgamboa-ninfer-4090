@@ -2,6 +2,7 @@
 
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
+#include "serve/serve_progress.h"
 #include "serve/openai_responses.h"
 #include "serve/request_validation.h"
 
@@ -267,12 +268,15 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         .output_tokens_explicit            = request.requested_max_output_tokens.has_value(),
         .preserve_thinking_semantic_change = resolved.preserve_thinking_semantic_change,
     };
+    std::shared_ptr<ProgressObserver> progress =
+        options_.llamacpp_log ? std::make_shared<ProgressObserver>() : nullptr;
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
             resolved.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
-            {}, [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
+            {}, [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints),
+            progress);
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -287,9 +291,16 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
+    std::string x_request_id = req.get_header_value("x-request-id");
+    if (x_request_id.empty()) { x_request_id = id; }
+    if (progress) {
+        progress->set_identity(req_id, x_request_id);
+    }
+
     const std::int64_t created = unix_time_now();
     auto lifecycle             = begin_request(make_request_log_context(
-        req_id, "openai_responses", resolved.generation, metadata, prepared));
+        req_id, x_request_id, "openai_responses", resolved.generation, metadata, prepared,
+        options_.llamacpp_log));
     resolved.generation.messages.clear();
 
     if (!request.stream) {

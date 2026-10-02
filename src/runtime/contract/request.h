@@ -20,6 +20,7 @@ struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    std::function<void(const ProgressEvent&)> progress_sink;
 };
 
 enum class ContinuationAction : std::uint8_t {

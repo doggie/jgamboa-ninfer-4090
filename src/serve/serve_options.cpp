@@ -284,6 +284,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--llamacpplog") {
+            options.llamacpp_log = true;
         } else if (arg == "--slot-save-path") {
             options.slot_save_path = require_value("--slot-save-path");
             if (options.slot_save_path.empty()) {

@@ -150,6 +150,91 @@ std::string response_request_id(const httplib::Response& response) {
     return {};
 }
 
+// Query-string helpers for /debug/cache. This httplib build exposes Request::query as the raw,
+// still percent-encoded string (no leading '?') with no built-in parser, so split, parse and
+// decode it by hand.
+int hex_digit_value(char c) noexcept {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+std::string url_decode_component(std::string_view component) {
+    std::string out;
+    out.reserve(component.size());
+    for (std::size_t i = 0; i < component.size(); ++i) {
+        const char c = static_cast<char>(component[i]);
+        if (c == '%' && i + 2 < component.size()) {
+            const int hi = hex_digit_value(static_cast<char>(component[i + 1]));
+            const int lo = hex_digit_value(static_cast<char>(component[i + 2]));
+            if (hi >= 0 && lo >= 0) {
+                out += static_cast<char>(static_cast<unsigned char>(hi) << 4 |
+                                         static_cast<unsigned char>(lo));
+                i += 2;
+                continue;
+            }
+        }
+        if (c == '+') {
+            out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> get_query_value(std::string_view query, std::string_view key) {
+    std::string_view remaining = query;
+    while (true) {
+        const std::size_t amp = remaining.find('&');
+        const std::string_view pair =
+            (amp == std::string_view::npos) ? remaining : remaining.substr(0, amp);
+        const std::size_t eq = pair.find('=');
+        if (eq != std::string_view::npos && pair.substr(0, eq) == key) {
+            return url_decode_component(pair.substr(eq + 1));
+        }
+        if (amp == std::string_view::npos) {
+            return {};
+        }
+        remaining = remaining.substr(amp + 1);
+    }
+}
+
+// Curated read-only slice of RuntimeStats relevant to the continuation/cache state.
+nlohmann::json make_cache_stats_json(const ninfer::RuntimeStats& stats) {
+    nlohmann::json j = nlohmann::json::object();
+    j["device_main_kv_occupied_pages"]   = stats.device_main_kv_occupied_pages;
+    j["device_backend_kv_occupied_pages"] = stats.device_backend_kv_occupied_pages;
+    j["host_kv_occupied_bytes"]           = stats.host_kv_occupied_bytes;
+    j["device_state_occupied_slots"]      = stats.device_state_occupied_slots;
+    j["host_state_occupied_slots"]        = stats.host_state_occupied_slots;
+    j["pressure_spill_pages"]             = stats.pressure_spill_pages;
+    j["pressure_private_owners_degraded"] = stats.pressure_private_owners_degraded;
+    j["pressure_private_owners_evicted"]  = stats.pressure_private_owners_evicted;
+    j["pressure_shared_owners_degraded"]  = stats.pressure_shared_owners_degraded;
+    j["pressure_shared_owners_evicted"]   = stats.pressure_shared_owners_evicted;
+    j["pressure_checkpoints_dropped"]     = stats.pressure_checkpoints_dropped;
+    j["pressure_searches"]                = stats.pressure_searches;
+    j["pressure_search_budget_exhaustions"] = stats.pressure_search_budget_exhaustions;
+    j["pressure_maximal_fallback_selections"] = stats.pressure_maximal_fallback_selections;
+    j["shared_active_references"]         = stats.shared_active_references;
+    j["reused_prompt_tokens"]             = stats.reused_prompt_tokens;
+    j["root_selections"]                  = stats.root_selections;
+    j["private_endpoint_selections"]      = stats.private_endpoint_selections;
+    j["private_turn_closure_selections"]  = stats.private_turn_closure_selections;
+    j["private_response_replay_selections"] = stats.private_response_replay_selections;
+    j["private_long_anchor_selections"]   = stats.private_long_anchor_selections;
+    j["shared_stable_prefix_selections"]  = stats.shared_stable_prefix_selections;
+    j["state_moves"]                      = stats.state_moves;
+    j["state_forks"]                      = stats.state_forks;
+    j["state_restores"]                   = stats.state_restores;
+    j["computed_prefill_tokens"]          = stats.computed_prefill_tokens;
+    j["committed_decode_tokens"]          = stats.committed_decode_tokens;
+    j["decode_rounds"]                    = stats.decode_rounds;
+    return j;
+}
+
 } // namespace
 
 void write_openai_error(httplib::Response& response, const ApiError& error) {
@@ -301,8 +386,13 @@ void HttpServer::record_response_failure(std::uint64_t request_id, const Request
 }
 
 void HttpServer::record_throughput(const ThroughputReport& report) {
+    // The structured JSONL always carries the throughput record; under --llamacpplog the
+    // repeated per-tick throughput lines are replaced by the per-request llama.cpp-style
+    // summary so the console is not cluttered by a line every log_stats_interval_ms.
     request_jsonl_.write_throughput(report);
-    operational_log_.throughput(report);
+    if (!options_.llamacpp_log) {
+        operational_log_.throughput(report);
+    }
 }
 
 void HttpServer::run_stats_reporter() {
@@ -519,6 +609,88 @@ void HttpServer::register_routes() {
     // {"filename": NAME}. Enabled only by --slot-save-path.
     server_.Post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slot_action(req, res);
+    });
+    // Read-only live view of the continuation/cache state: a curated RuntimeStats snapshot
+    // plus one entry per Engine lane (the continuation-catalog cell space, one slot each).
+    // It only reads published snapshots (runtime_stats() / slot_states()); it never calls
+    // expire_*/evict_*, so repeated reads must not change what they report. `?max_aliases=N`
+    // caps the per-lane list (default 200; "full" or "0" => no truncation; a positive integer
+    // => exactly that many). Inherits the global api_key gate like the other non-health routes.
+    server_.Get("/debug/cache", [this](const httplib::Request& req, httplib::Response& res) {
+        const bool attached = service_ != nullptr;
+        const ninfer::RuntimeStats stats =
+            attached ? service_->runtime_stats() : ninfer::RuntimeStats{};
+        std::vector<ninfer::SlotState> states;
+        std::uint32_t alias_count = 0;
+        if (attached) {
+            states = service_->slot_states();
+            alias_count = service_->slot_count();
+        }
+
+        // Parse ?max_aliases: default 200, "full" or "0" => unlimited, positive int => that count.
+        std::size_t alias_limit = 200;
+        bool unlimited = false;
+        const auto max_aliases = get_query_value(req.query, "max_aliases");
+        if (max_aliases) {
+            const std::string value = *max_aliases;
+            if (value == "full") {
+                unlimited = true;
+            } else {
+                bool all_digits = !value.empty();
+                for (char ch : value) {
+                    if (ch < '0' || ch > '9') { all_digits = false; break; }
+                }
+                if (all_digits) {
+                    std::size_t numeric = 0;
+                    for (char ch : value) {
+                        numeric = numeric * 10 + static_cast<unsigned>(ch - '0');
+                    }
+                    if (numeric == 0) {
+                        unlimited = true;          // "0" (or "00") => no truncation
+                    } else {
+                        alias_limit = numeric;
+                    }
+                } else {
+                    res.status = 400;
+                    res.set_content(nlohmann::json{{"error", "invalid max_aliases"},
+                                                   {"valid",
+                                                    "a positive integer, 0, or \"full\""}}
+                                               .dump(), "application/json");
+                    return;
+                }
+            }
+        }
+
+        std::size_t returned_cap = alias_count;
+        if (!unlimited && alias_limit < returned_cap) {
+            returned_cap = alias_limit;
+        }
+
+        nlohmann::json aliases_json = nlohmann::json::array();
+        for (std::uint32_t i = 0; i < alias_count && aliases_json.size() < returned_cap; ++i) {
+            const ninfer::SlotState state =
+                i < states.size() ? states[i] : ninfer::SlotState{};
+            nlohmann::json checkpoints_json = nlohmann::json::array();
+            for (const ninfer::SlotCheckpoint& checkpoint : state.checkpoints) {
+                checkpoints_json.push_back({{"frontier", checkpoint.frontier},
+                                            {"session_digest", checkpoint.session_digest}});
+            }
+            aliases_json.push_back({{"id", static_cast<std::uint32_t>(i)},
+                                     {"is_processing", state.processing},
+                                     {"retained", state.retained},
+                                     {"session_digest", state.session_digest},
+                                     {"n_prompt_tokens", state.prompt_tokens},
+                                     {"n_prompt_tokens_cache", state.cached_tokens},
+                                     {"checkpoints", std::move(checkpoints_json)}});
+        }
+
+        nlohmann::json result = nlohmann::json::object();
+        result["attached"] = attached;
+        result["stats"] = make_cache_stats_json(stats);
+        result["alias_count"] = static_cast<std::uint64_t>(alias_count);
+        result["aliases_returned"] = static_cast<std::uint64_t>(aliases_json.size());
+        result["aliases"] = std::move(aliases_json);
+        res.set_content(result.dump(), "application/json");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);

@@ -847,6 +847,38 @@ private:
         cumulative_stats_.last_selected_frontier_tokens = summary.reusable_prompt_tokens;
     }
 
+    // Best-effort in-flight progress sample. Empty by default; set only when the serve layer opts
+    // in (e.g. --llamacpplog). The callback may block or throw, but must never take down the
+    // execution loop — it is isolated in a try/catch, and the elapsed figure is measured here (not
+    // by the callback), so a slow observer perturbs only its own console, never the engine.
+    void emit_progress(const std::shared_ptr<Request>& request, ProgressEvent::Phase phase,
+                       std::uint64_t tokens, Clock::time_point anchor) const noexcept {
+        const auto& sink = request->options.progress_sink;
+        if (!sink) { return; }
+        try {
+            const double elapsed =
+                std::chrono::duration<double>(Clock::now() - anchor).count();
+            sink(ProgressEvent{phase, tokens, elapsed});
+        } catch (...) { /* a progress observer must never crash the execution loop */ }
+    }
+
+    // One-shot cache-plan notice, delivered after the reuse decision is final and before the
+    // first prefill unit runs (mirrors llama-server's up-front cache figure). Throttled on the
+    // serve side (at most once per request) rather than per second, and it carries the tier the
+    // planned reuse comes from. Best-effort and never blocking.
+    void emit_cache_plan(const std::shared_ptr<Request>& request, std::uint64_t reused_tokens,
+                         std::string tier) const noexcept {
+        const auto& sink = request->options.progress_sink;
+        if (!sink) { return; }
+        try {
+            ProgressEvent e;
+            e.phase      = ProgressEvent::Phase::CachePlanned;
+            e.tokens     = reused_tokens;
+            e.cache_tier = std::move(tier);
+            sink(e);
+        } catch (...) { /* a progress observer must never crash the execution loop */ }
+    }
+
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
                                       const CancellationView& cancellation) {
         struct ConsumerGuard {
@@ -1531,6 +1563,15 @@ private:
                 auto published = request->output.commit_preview();
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing));
+                // In-flight decode progress: emitted once per committed decode round for every
+                // non-cancelled, non-terminal row. The serve-side ProgressObserver throttles the
+                // console display (at most one line per second), so this is cheap per round.
+                if (decode_round && !cancelled[row] && !decisions[row].terminal &&
+                    request->options.progress_sink) {
+                    emit_progress(request, ProgressEvent::Phase::Decode,
+                                  request->generated.size(),
+                                  request->first_token ? *request->first_token : request->submitted);
+                }
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
@@ -1697,6 +1738,9 @@ private:
             throw std::logic_error("prefill request has no sequence handle");
         }
         setup.finish();
+        // Anchor prefill elapsed time at the first unit so the serve-side observer can report a
+        // stable progress fraction across the whole encode phase.
+        if (!request->prefill_started) { request->prefill_started = Clock::now(); }
         ProgramCallScope program_call(*this);
         const Clock::time_point prefill_started = Clock::now();
         auto progress =
@@ -1705,6 +1749,13 @@ private:
             std::chrono::duration<double>(Clock::now() - prefill_started).count();
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        // In-flight prefill progress: cumulative computed_prompt_tokens against the first-unit
+        // anchor. Mid units keep the request prefilling; the final unit hands off to decode, in
+        // which case decode progress takes over, so emit only while still prefilling.
+        if (request->options.progress_sink && request->is_prefilling()) {
+            emit_progress(request, ProgressEvent::Phase::Prefill,
+                          request->computed_prompt_tokens, *request->prefill_started);
+        }
         publish_runtime_stats();
     }
 
@@ -1847,6 +1898,18 @@ private:
                     request->queue_wait_recorded = true;
                     slots_[lane]                 = request;
                     record_prefix_selection(control.summary);
+                    // Surface the (planned) cache reuse up front, before the first prefill unit
+                    // runs, so the console log shows how much prompt will be served from cache
+                    // (mirrors llama-server's up-front cache figure). In the current architecture
+                    // prefix reuse is device-resident KV ("l1"); there is no separate host/l3
+                    // restoration to distinguish, so any reused depth is reported as l1.
+                    if (request->options.progress_sink) {
+                        const std::uint64_t planned_reuse =
+                            static_cast<std::uint64_t>(control.summary.reusable_prompt_tokens);
+                        const std::string cache_tier =
+                            planned_reuse > 0 ? "l1" : "none";
+                        emit_cache_plan(request, planned_reuse, std::move(cache_tier));
+                    }
                     materializing_.reset();
                     scheduler_.set_prefill_lane(lane);
                     request_admission_check();
