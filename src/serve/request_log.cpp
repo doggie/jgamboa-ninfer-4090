@@ -314,6 +314,7 @@ Json ngram_json(const ninfer::NgramOptions& ngram) {
 
 Json speculative_json(const GenerationMetrics& metrics) {
     return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
+                {"policy_version", product::kSpecPolicyVersion},
                 {"draft_window", metrics.speculative_draft_window},
                 {"rounds", metrics.speculative_rounds},
                 {"drafted_tokens", metrics.speculative_draft_tokens},
@@ -501,6 +502,7 @@ std::string format_server_start_json(
              {"prefix_reuse", options.allow_prefix_reuse},
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
+             {"speculative_policy_version", product::kSpecPolicyVersion},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
              {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
              {"ngram", ngram_json(engine_options.speculative.ngram)},

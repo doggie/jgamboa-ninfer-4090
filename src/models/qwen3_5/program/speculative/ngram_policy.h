@@ -47,13 +47,20 @@ inline constexpr std::uint32_t kNgramWideRoundMargin = 3;
  * Verify drafts for an MTP round with n-gram chaining. `usable` holds each row's draft count
  * after the budget and context clamps (at most `verify_window`). Returns `verify_window` when
  * some row reaches depth + kNgramWideRoundMargin, otherwise `depth`.
+ * `constrain_wide` (multi-lane rounds pass false) prevents the round from widening to
+ * `verify_window` at all: the batch stays on the narrow `depth`-width graph and no row's
+ * long chain can force extra verified columns for every lane. Rows keep their usable counts
+ * in that round, but the caller derives each row's extent as min(usable, verify_drafts), so
+ * no row's recorded or committed extent exceeds the narrow graph width.
  */
 [[nodiscard]] inline std::uint32_t ngram_round_verify_drafts(std::span<const std::uint32_t> usable,
                                                              std::uint32_t depth,
-                                                             std::uint32_t verify_window) {
+                                                             std::uint32_t verify_window,
+                                                             bool constrain_wide = true) {
     if (depth == 0 || verify_window < depth) {
         throw std::invalid_argument("n-gram round needs 1 <= depth <= verify window");
     }
+    if (!constrain_wide) { return depth; }
     const bool wide = std::any_of(usable.begin(), usable.end(), [&](std::uint32_t count) {
         return count >= depth + kNgramWideRoundMargin;
     });

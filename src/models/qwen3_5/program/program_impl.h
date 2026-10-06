@@ -366,8 +366,8 @@ struct SequenceState {
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
     // Ledger prefix already reported to the n-gram pool; reset where a request rebinds the ledger.
-    std::size_t ngram_observed    = 0;
-    bool tail_hidden_valid        = false;
+    std::size_t ngram_observed = 0;
+    bool tail_hidden_valid             = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;

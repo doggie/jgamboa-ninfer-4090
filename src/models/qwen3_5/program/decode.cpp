@@ -84,6 +84,14 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {
 
+// Multi-lane MTP rounds stay on the narrow K+1 graph: the n-gram chain may widen the round
+// only when a single lane owns it. A wide round is shared batch state, so one lane's long
+// chain would otherwise add verified columns for every lane while the pool's hit rate sits
+// well below what those columns cost. Single-lane rounds keep the wide path, where the
+// speculative speedup is unconditionally worth its columns.
+// This policy is tagged as product::kSpecPolicyVersion, emitted in the startup and
+// request-done logs; bump both together when the multi-lane speculation policy changes.
+
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label);
 
@@ -130,6 +138,7 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
 }
 
 } // namespace
+
 
 void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& request,
                                    const ops::SamplingConfig& config) {
@@ -469,10 +478,15 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         usable_drafts[row] = std::min({static_cast<std::uint32_t>(count), max_by_budget,
                                        capacity - sequence.execution_frontier - 1});
     }
+    // When multiple lanes run concurrently, prevent n-gram chain drafts from widening the round
+    // to the full verify window (V=15). Multi-lane rounds stay on the narrow MTP width (K+1=3),
+    // which eliminates the memory bandwidth and graph overhead of empty/speculative verify columns
+    // across all lanes. Single-lane rounds retain wide verification.
+    const bool allow_wide = lanes.size() <= 1;
     const std::uint32_t verify_drafts =
         ngram_pool ? ngram_round_verify_drafts(
                          std::span<const std::uint32_t>(usable_drafts.data(), lanes.size()),
-                         draft_window, verify_window)
+                         draft_window, verify_window, allow_wide)
                    : draft_window;
     const std::uint32_t width     = verify_drafts + 1;
     const bool wide_round         = verify_drafts != draft_window;

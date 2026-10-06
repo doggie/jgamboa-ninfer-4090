@@ -11,6 +11,10 @@
 
 namespace ninfer::product {
 
+// Version tag emitted in startup and request-done logs so deployments can confirm which
+// speculative throttling policy is active in a running service.
+inline constexpr std::string_view kSpecPolicyVersion = "spec-v2-narrow-multilane";
+
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }

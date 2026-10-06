@@ -122,6 +122,8 @@ void test_round_width_policy() {
           "a draft below the margin must not widen the round");
     const std::array<std::uint32_t, 3> one_wide{1, k + kNgramWideRoundMargin, 0};
     check(ngram_round_verify_drafts(one_wide, k, v) == v, "one long draft widens the round");
+    check(ngram_round_verify_drafts(one_wide, k, v, false) == k,
+          "a constrained round stays narrow even with one long draft");
     check(ngram_round_verify_drafts({}, k, v) == k, "an empty batch keeps width k+1");
     check(throws_invalid([] { (void)ngram_round_verify_drafts({}, 4, 3); }),
           "a verify window below the depth must be rejected");
