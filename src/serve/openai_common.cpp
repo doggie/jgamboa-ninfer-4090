@@ -172,9 +172,36 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
             *automatic_target = CacheBoundary{.evidence = evidence};
         }
     }
-    // OpenAI already defines the automatic/explicit write policy for every request. Existing
-    // exact shared residents are still considered by the Engine independently of this switch.
-    request.allow_engine_automatic_shared_prefixes = false;
+
+    // Optimization for cache hit rate: Automatically anchor the first non-empty message
+    // (usually system prompt or the first turn) as a shared prefix candidate.
+    for (auto turn = request.messages.begin(); turn != request.messages.end(); ++turn) {
+        if (!turn->tool_calls.empty() || !turn->content.empty()) {
+            std::optional<CacheBoundary>* lead_target = &turn->cache_boundary_after;
+            if (!turn->tool_calls.empty()) {
+                lead_target = &turn->cache_boundary_after;
+            } else {
+                lead_target = &turn->content.back().cache_boundary_after;
+            }
+            
+            const ninfer::SharedCandidateEvidence evidence =
+                policy.automatic == OpenAIPromptCacheAutomatic::Default
+                    ? ninfer::SharedCandidateEvidence::DefaultAutomatic
+                    : ninfer::SharedCandidateEvidence::RequestedAutomatic;
+            if (*lead_target) {
+                lead_target->value().kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+                lead_target->value().evidence |= evidence;
+            } else {
+                *lead_target = CacheBoundary{
+                    .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                    .evidence = evidence
+                };
+            }
+            break;
+        }
+    }
+    // Allow engine to automatically compute structural shared prefixes (system, tools, etc.)
+    request.allow_engine_automatic_shared_prefixes = true;
 }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,
