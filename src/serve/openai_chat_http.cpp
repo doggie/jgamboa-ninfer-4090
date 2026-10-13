@@ -48,10 +48,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             .live_timings    = request.stream && request.timings_per_token,
             .prompt_progress = request.stream && request.return_progress,
         };
+        ContextCacheHints cache_hints;
+        for (const char* header : {"x-session-id", "x-conversation-id"}) {
+            std::string value = req.get_header_value(header);
+            if (!value.empty() && value.size() <= ninfer::kMaximumContextCacheSessionKeyBytes) {
+                cache_hints.session_key = std::move(value);
+                break;
+            }
+        }
         prepared = service_->prepare(
             request.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
-            observation, [&req] { return client_disconnected(req); }, ContextCacheHints{}, progress);
+            observation, [&req] { return client_disconnected(req); }, std::move(cache_hints),
+            progress);
     } catch (const ApiException& exception) {
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, exception.error()));

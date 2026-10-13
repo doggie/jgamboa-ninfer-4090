@@ -141,15 +141,40 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
         automatic_target = &request.tools.back().cache_boundary_after;
     }
 
+    // Find the leading non-empty message (usually system prompt or the first turn) to anchor
+    // as a shared prefix candidate when automatic caching is not explicitly disabled.
+    std::optional<CacheBoundary>* lead_target = nullptr;
+    if (policy.automatic != OpenAIPromptCacheAutomatic::Disabled) {
+        for (auto turn = request.messages.begin(); turn != request.messages.end(); ++turn) {
+            if (!turn->tool_calls.empty()) {
+                lead_target = &turn->cache_boundary_after;
+                break;
+            }
+            if (!turn->content.empty()) {
+                lead_target = &turn->content.back().cache_boundary_after;
+                break;
+            }
+        }
+        if (lead_target == automatic_target) {
+            lead_target = nullptr;
+        }
+    }
+
     const bool automatic_enabled =
         policy.automatic != OpenAIPromptCacheAutomatic::Disabled && automatic_target != nullptr;
-    const bool automatic_merges_explicit   = automatic_enabled && automatic_target->has_value();
-    const std::size_t explicit_write_slots = !automatic_enabled || automatic_merges_explicit
-                                                 ? kMaximumExplicitPromptCacheMarkers
-                                                 : kMaximumExplicitPromptCacheMarkers - 1U;
-    const std::size_t first_selected       = explicit_boundaries.size() > explicit_write_slots
-                                                 ? explicit_boundaries.size() - explicit_write_slots
-                                                 : 0U;
+    const bool automatic_merges_explicit = automatic_enabled && automatic_target->has_value();
+    const bool lead_enabled              = lead_target != nullptr;
+    const bool lead_merges_explicit      = lead_enabled && lead_target->has_value();
+    const std::size_t reserved_auto_slots =
+        (automatic_enabled && !automatic_merges_explicit ? 1U : 0U) +
+        (lead_enabled && !lead_merges_explicit ? 1U : 0U);
+    const std::size_t explicit_write_slots =
+        kMaximumExplicitPromptCacheMarkers > reserved_auto_slots
+            ? kMaximumExplicitPromptCacheMarkers - reserved_auto_slots
+            : 0U;
+    const std::size_t first_selected = explicit_boundaries.size() > explicit_write_slots
+                                           ? explicit_boundaries.size() - explicit_write_slots
+                                           : 0U;
     for (std::size_t index = 0; index < explicit_boundaries.size(); ++index) {
         if (index < first_selected) {
             explicit_boundaries[index]->reset();
@@ -161,45 +186,31 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
         }
     }
 
+    const ninfer::SharedCandidateEvidence auto_evidence =
+        policy.automatic == OpenAIPromptCacheAutomatic::Default
+            ? ninfer::SharedCandidateEvidence::DefaultAutomatic
+            : ninfer::SharedCandidateEvidence::RequestedAutomatic;
+
     if (automatic_enabled) {
-        const ninfer::SharedCandidateEvidence evidence =
-            policy.automatic == OpenAIPromptCacheAutomatic::Default
-                ? ninfer::SharedCandidateEvidence::DefaultAutomatic
-                : ninfer::SharedCandidateEvidence::RequestedAutomatic;
         if (*automatic_target) {
-            automatic_target->value().evidence |= evidence;
+            automatic_target->value().evidence |= auto_evidence;
         } else {
-            *automatic_target = CacheBoundary{.evidence = evidence};
+            *automatic_target = CacheBoundary{.evidence = auto_evidence};
         }
     }
 
-    // Optimization for cache hit rate: Automatically anchor the first non-empty message
-    // (usually system prompt or the first turn) as a shared prefix candidate.
-    for (auto turn = request.messages.begin(); turn != request.messages.end(); ++turn) {
-        if (!turn->tool_calls.empty() || !turn->content.empty()) {
-            std::optional<CacheBoundary>* lead_target = &turn->cache_boundary_after;
-            if (!turn->tool_calls.empty()) {
-                lead_target = &turn->cache_boundary_after;
-            } else {
-                lead_target = &turn->content.back().cache_boundary_after;
-            }
-            
-            const ninfer::SharedCandidateEvidence evidence =
-                policy.automatic == OpenAIPromptCacheAutomatic::Default
-                    ? ninfer::SharedCandidateEvidence::DefaultAutomatic
-                    : ninfer::SharedCandidateEvidence::RequestedAutomatic;
-            if (*lead_target) {
-                lead_target->value().kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
-                lead_target->value().evidence |= evidence;
-            } else {
-                *lead_target = CacheBoundary{
-                    .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-                    .evidence = evidence
-                };
-            }
-            break;
+    if (lead_enabled) {
+        if (*lead_target) {
+            lead_target->value().kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+            lead_target->value().evidence |= auto_evidence;
+        } else {
+            *lead_target = CacheBoundary{
+                .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence = auto_evidence,
+            };
         }
     }
+
     // Allow engine to automatically compute structural shared prefixes (system, tools, etc.)
     request.allow_engine_automatic_shared_prefixes = true;
 }
