@@ -1,0 +1,38 @@
+[Unit]
+Description=NInfer-4090 JGamboa Ternary-Bonsai-2-27B (262K ctx, rk4v4-e8 KV, MTP draft-2 + lm-head-draft + ngram chain, vision, host-KV 24GB multi-slot)
+After=network.target
+
+[Service]
+User=emi
+WorkingDirectory=/home/emi/code/jgamboa-ninfer-4090
+ExecStart=/home/emi/code/jgamboa-ninfer-4090/build/apps/ninfer-serve \
+    /home/emi/model/tensorninja-4090/models/bonsai2_27b_vl_mtp_q4q5.ninfer \
+    --host 0.0.0.0 --port 8080 \
+    --max-context 262144 \
+    --kv-capacity auto \
+    --kv-dtype rk4v4-e8 \
+    --max-concurrency 3 \
+    --prefill-chunk 512 \
+    --host-kv-mib 16384 \
+    --host-state-slots 48 \
+    --max-private-continuations 18 \
+    --max-shared-prefixes 16 \
+    --auto-long-anchors 6 \
+    --max-long-anchors-per-continuation 8 \
+    --spec mtp --draft-tokens 2 --lm-head-draft \
+    --ngram chain \
+    --ngram-n 4 \
+    --ngram-max 15 \
+    --ngram-min 1 \
+    --ngram-pool-mib 128 \
+    --vision \
+    --vision-max-tokens 32768 \
+    --preserve-thinking \
+    --model-id qwen3.8-27b \
+    --request-log-jsonl /home/emi/code/jgamboa-ninfer-4090/logs/requests.jsonl
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
