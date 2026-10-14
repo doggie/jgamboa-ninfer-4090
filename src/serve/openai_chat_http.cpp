@@ -10,7 +10,9 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -55,6 +57,36 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 cache_hints.session_key = std::move(value);
                 break;
             }
+        }
+        // Fallback fingerprint when the client does not send an explicit session
+        // header: hash the request's first turn (system + leading messages) so
+        // multi-turn conversations still cluster under a LiveSession index and
+        // private anchors stay alive. The hash is bounded to the session-key
+        // byte limit and stays opaque; it only affects cache retention weight,
+        // never response isolation.
+        if (!cache_hints.session_key && !request.generation.messages.empty()) {
+            std::uint64_t hash = 1469598103934665603ULL; // FNV-1a offset basis
+            const auto mix = [&](std::string_view value) {
+                for (const unsigned char c : value) {
+                    hash ^= static_cast<std::uint64_t>(c);
+                    hash *= 1099511628211ULL; // FNV-1a prime
+                }
+            };
+            const ChatTurn& first = request.generation.messages.front();
+            for (const ContentPart& part : first.content) {
+                mix(part.text);
+            }
+            mix(first.tool_call_id);
+            mix(first.reasoning_content);
+            if (!request.generation.tools.empty()) {
+                for (const ToolDefinition& tool : request.generation.tools) {
+                    mix(tool.name);
+                    mix(tool.input_schema_json);
+                }
+            }
+            std::ostringstream fingerprint;
+            fingerprint << "fp_" << std::hex << hash;
+            cache_hints.session_key = fingerprint.str();
         }
         prepared = service_->prepare(
             request.generation,
