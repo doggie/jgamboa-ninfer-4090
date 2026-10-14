@@ -516,6 +516,44 @@ void GenerationService::warmup() {
                      CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup,
                      std::shared_ptr<ProgressObserver>{});
     run(prepared, nullptr);
+
+    // Cold-start pre-materialization: establish a SharedStablePrefix checkpoint for
+    // the primary tools/system frontiers so the first real request of a new session
+    // hits `shared_stable_prefix` instead of `root`. This is critical for clients
+    // that send heavy tool configurations on turn 1.
+    try {
+        GenerationRequest cache_bootstrap;
+        ChatTurn bootstrap_turn;
+        bootstrap_turn.role = ChatRole::User;
+        ContentPart bootstrap_content;
+        bootstrap_content.kind     = ContentKind::Text;
+        bootstrap_content.text     = "system context initialization";
+        bootstrap_content.type_raw = "text";
+        bootstrap_turn.content.push_back(std::move(bootstrap_content));
+        cache_bootstrap.messages.push_back(std::move(bootstrap_turn));
+
+        // Inject mock tools to trigger the same structural boundaries the engine
+        // places on real requests, forcing materialization of the leading prefix.
+        for (std::size_t i = 0; i < 43; ++i) {
+            ToolDefinition tool;
+            tool.name              = "bootstrap_tool_" + std::to_string(i);
+            tool.description       = "Bootstrap boundary placeholder";
+            tool.input_schema_json = "{}";
+            cache_bootstrap.tools.push_back(std::move(tool));
+        }
+        cache_bootstrap.allow_engine_automatic_shared_prefixes = true;
+
+        ContextCacheHints hints;
+        hints.allow_engine_automatic_shared_prefixes = true;
+        PreparedRequest bootstrap_prepared =
+            prepare_impl(cache_bootstrap, GenerationConsumerMode::Aggregate, {}, {},
+                         std::move(hints), CacheParticipation::ReadWrite,
+                         DeadlinePolicy::UnboundedStartup,
+                         std::shared_ptr<ProgressObserver>{});
+        run(bootstrap_prepared, nullptr);
+    } catch (...) {
+        // Non-fatal: pre-materialization failure should not prevent service startup.
+    }
 }
 
 } // namespace ninfer::serve
