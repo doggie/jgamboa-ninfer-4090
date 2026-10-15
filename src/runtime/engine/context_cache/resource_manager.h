@@ -512,7 +512,7 @@ public:
         if (manager_transaction != program_transaction) {
             throw std::logic_error("capture observes inconsistent transaction ownership");
         }
-        if (program_transaction) {
+        if (program_transaction || program.has_unsettled_state_fork()) {
             program.skip_capture(std::move(offer));
             return ActiveCaptureReserveResult::Skipped;
         }

@@ -29,7 +29,7 @@ struct PlanningAllowance {
     [[nodiscard]] static PlanningAllowance
     boundary(std::uint32_t other_runnable, std::uint64_t now = planning_now_ns()) noexcept {
         return {.started_ns        = now,
-                .limit_ns          = other_runnable == 0 ? 200'000'000ULL : 25'000'000ULL,
+                .limit_ns          = other_runnable == 0 ? 300'000'000ULL : 200'000'000ULL,
                 .affected_requests = 1U + other_runnable};
     }
 
@@ -51,7 +51,7 @@ public:
                                 std::uint64_t initial_cost) noexcept
         : allowance_(allowance), started_(started),
           granted_(std::min(
-              {std::uint64_t{250'000'000ULL}, economic(initial_cost), allowance.remaining(started)})) {}
+              {std::uint64_t{500'000'000ULL}, economic(initial_cost), allowance.remaining(started)})) {}
 
     [[nodiscard]] bool allow(std::uint64_t now, std::uint64_t next_operation_ns,
                              std::uint64_t completion_ns, std::uint64_t gain_ns,
@@ -84,7 +84,7 @@ public:
         const auto hard = elapsed + remaining; // bounded by the allowance's representable duration
         const auto growth = std::max(granted_, next_operation_ns);
         auto added        = std::min(growth, hard > granted_ ? hard - granted_ : 0);
-        if (!complete_prediction) { added = std::min<std::uint64_t>(added, 250'000'000ULL); }
+        if (!complete_prediction) { added = std::min<std::uint64_t>(added, 500'000'000ULL); }
         if (added == 0 || elapsed + next_operation_ns > granted_ + added) {
             reason_ = MaterializationStopReason::TimeBudget;
             return false;
