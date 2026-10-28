@@ -986,6 +986,10 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
+    // A fake sequence never carries an unsettled state fork, so capture is never skipped for
+    // that reason. The real Program returns true while COW state awaits its first decode.
+    [[nodiscard]] bool has_unsettled_state_fork() const noexcept { return false; }
+
     [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
                                                         const FakeSharedPrefixHandle*,
                                                         const FakeSharedPrefixHandle*,

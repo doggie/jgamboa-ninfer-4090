@@ -1770,7 +1770,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         result.pressure_committed = true;
         result.final_summary.reset();
     };
-    const auto complete_victim_acknowledgement = [&]() {
+    const auto complete_victim_acknowledgement = [&](bool published) {
         for (std::size_t position = 0; position < transaction.victim_count; ++position) {
             if (transaction.victim_released[position]) { continue; }
             const std::uint32_t index      = transaction.victim_indices[position];
@@ -1778,6 +1778,14 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             if (index >= continuation_capacity ||
                 continuation_slots[index].role != ContinuationSlotRole::Catalogued ||
                 continuation_slots[index].generation != generation) {
+                if (!published && transaction.pressure[position].option.evicts_continuation) {
+                    // The abort path can reach this only when the planned eviction already
+                    // retired the claim physically but the released flag was not set (a sibling
+                    // abort step). Report the eviction that happened rather than throwing; a
+                    // Retained claim must still be present, so that case stays an invariant.
+                    evict_private_result(transaction.pressure_results[position]);
+                    continue;
+                }
                 throw std::logic_error("unmodified pressure claim is unavailable");
             }
             retain_private_result(transaction.pressure_results[position],
@@ -1795,10 +1803,24 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             });
             return;
         }
-        if (transaction.source_index >= continuation_capacity ||
-            continuation_slots[transaction.source_index].role != ContinuationSlotRole::Catalogued ||
-            continuation_slots[transaction.source_index].generation !=
-                transaction.source_generation) {
+        const bool source_still_catalogued =
+            transaction.source_index < continuation_capacity &&
+            continuation_slots[transaction.source_index].role ==
+                ContinuationSlotRole::Catalogued &&
+            continuation_slots[transaction.source_index].generation ==
+                transaction.source_generation;
+        if (!published && transaction.source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
+            !source_still_catalogued) {
+            // start_request consumed and then released the source slot before the transaction
+            // aborted (e.g. the post-activation entitlement check). The catalog cell is already
+            // logically unclaimed, so report the consumption instead of demanding the Retain
+            // acknowledgement shape.
+            out.source.emplace(MaterializationSourceResult{
+                .mode = runtime::PrivateSourceMode::ConsumeToActive,
+            });
+            return;
+        }
+        if (!source_still_catalogued) {
             throw std::logic_error("retained materialization source is unavailable");
         }
         SequenceState& source = continuation_states[transaction.source_index];
@@ -1810,11 +1832,22 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     };
     const auto complete_shared_source_acknowledgement = [&](bool published) {
         if (!transaction.has_shared_source) { return; }
-        if (transaction.shared_source_index >= shared_prefix_capacity ||
-            shared_prefix_slots[transaction.shared_source_index].role !=
-                SharedPrefixSlotRole::Catalogued ||
-            shared_prefix_slots[transaction.shared_source_index].generation !=
-                transaction.shared_source_generation) {
+        const bool source_still_catalogued =
+            transaction.shared_source_index < shared_prefix_capacity &&
+            shared_prefix_slots[transaction.shared_source_index].role ==
+                SharedPrefixSlotRole::Catalogued &&
+            shared_prefix_slots[transaction.shared_source_index].generation ==
+                transaction.shared_source_generation;
+        if (!published && !source_still_catalogued) {
+            // On the abort path the shared source may already be gone physically: start_request
+            // incremented its active reference and the failure released that reference, or a
+            // sibling release path retired the slot. The catalog cell is already logically
+            // unclaimed, so report an unmodified source instead of demanding the published
+            // acknowledgement shape (the private-source branch above does the same).
+            out.shared_source.emplace(MaterializationSharedSourceResult{});
+            return;
+        }
+        if (!source_still_catalogued) {
             throw std::logic_error("retained materialization shared source is unavailable");
         }
         const SharedPrefixState& source = shared_prefix_states[transaction.shared_source_index];
@@ -1827,7 +1860,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             throw std::logic_error("published shared source lost its active reference");
         }
     };
-    const auto complete_shared_victim_acknowledgement = [&]() {
+    const auto complete_shared_victim_acknowledgement = [&](bool published) {
         for (std::size_t position = 0; position < transaction.shared_victim_count; ++position) {
             if (transaction.shared_victim_released[position]) { continue; }
             const std::uint32_t index      = transaction.shared_victim_indices[position];
@@ -1835,6 +1868,18 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             if (index >= shared_prefix_capacity ||
                 shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
                 shared_prefix_slots[index].generation != generation) {
+                if (!published && transaction.shared_pressure[position].option.evicts_continuation) {
+                    // Same tolerance as the private claims above: a planned shared eviction may
+                    // already have retired the slot physically on the abort path. Report the
+                    // eviction that happened instead of demanding the Retain acknowledgement.
+                    transaction.shared_pressure_results[position] =
+                        MaterializationSharedVictimResult{
+                            .owner              = transaction.shared_pressure_results[position].owner,
+                            .disposition        = runtime::VictimDisposition::Evicted,
+                            .pressure_committed = true,
+                        };
+                    continue;
+                }
                 throw std::logic_error("unmodified shared pressure claim is unavailable");
             }
             transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
@@ -1854,8 +1899,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         out.operations            = transaction.operations;
         complete_source_acknowledgement(false);
         complete_shared_source_acknowledgement(false);
-        complete_victim_acknowledgement();
-        complete_shared_victim_acknowledgement();
+        complete_victim_acknowledgement(false);
+        complete_shared_victim_acknowledgement(false);
     };
 
     if (cancellation.requested()) { transaction.cancel_pending = true; }
@@ -2193,6 +2238,19 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                    ")");
         }
         return out;
+    } catch (const std::bad_alloc& exhaustion) {
+        // start_request may hit the state-pool entitlement ceiling (reserve_state_entitlement
+        // throws std::bad_alloc) after its lane cleanup already ran. That is the same kind of
+        // per-request failure as a planning invariant — abort this request rather than letting
+        // the allocation fault latch the engine.
+        try {
+            abort_transaction();
+        } catch (const std::logic_error& acknowledgement) {
+            throw std::logic_error(std::string(exhaustion.what()) +
+                                   " (abort acknowledgement failed: " + acknowledgement.what() +
+                                   ")");
+        }
+        return out;
     } catch (...) {
         release_materialization_staging(transaction);
         throw;
@@ -2203,8 +2261,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     out.operations            = transaction.operations;
     complete_source_acknowledgement(true);
     complete_shared_source_acknowledgement(true);
-    complete_victim_acknowledgement();
-    complete_shared_victim_acknowledgement();
+    complete_victim_acknowledgement(true);
+    complete_shared_victim_acknowledgement(true);
     return out;
 }
 

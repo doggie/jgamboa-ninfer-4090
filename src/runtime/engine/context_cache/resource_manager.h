@@ -2775,6 +2775,8 @@ private:
             catalog_[record.private_source->slot].state == CatalogState::Claimed) {
             catalog_[record.private_source->slot].state = CatalogState::Catalogued;
         }
+        // A consumed source reported on the abort path was already released physically; the
+        // ConsumeToActive result handling above cleared it to Vacant, so nothing is restored.
         if (record.shared_source) {
             SharedCatalogEntry& source = shared_catalog_[record.shared_source->slot];
             if (source.transaction_pins != 0) { --source.transaction_pins; }
@@ -2897,7 +2899,12 @@ private:
             const CatalogEntry& source = catalog_[capability.slot];
             if (!result.source || source.state != CatalogState::Claimed ||
                 source.id != capability.owner.id || source.revision != capability.generation ||
-                (!published && result.source->mode != PrivateSourceMode::Retain) ||
+                // An aborted transaction normally reports Retain, but start_request may already
+                // have consumed the source slot before the failure that triggered the abort; in
+                // that case the physical program reports ConsumeToActive and the entry is
+                // released below rather than restored to Catalogued.
+                (!published && result.source->mode != PrivateSourceMode::Retain &&
+                 result.source->mode != PrivateSourceMode::ConsumeToActive) ||
                 (published && result.source->mode != record->source_mode) ||
                 (result.source->final_summary &&
                  !valid_continuation_summary(*result.source->final_summary)) ||
@@ -2986,13 +2993,10 @@ private:
                 source.state            = CatalogState::Catalogued;
                 retained_private_source = result.status == ContextTransactionStatus::Published;
             } else if (result.source->mode == PrivateSourceMode::ConsumeToActive) {
-                erase_session_if_owner(source.id);
-                source.handle.reset();
-                source.summary.endpoint.reset();
-                source.summary.rewrite.reset();
-                source.summary.long_anchors.clear();
-                source.observations.clear();
-                source.session.reset();
+                // The physical slot is already Free on an aborted transaction (start_request
+                // released it) and was published as the new active state on success; either way
+                // the consumed catalog entry is fully retired, not merely re-catalogued.
+                clear_catalog_entry(source);
             }
         }
 

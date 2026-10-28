@@ -295,7 +295,8 @@ int main() {
         .preserve_thinking_semantic_change = true,
     };
     const RequestLogContext context =
-        make_request_log_context(7, "openai_chat_completions", request, metadata, prepared);
+        make_request_log_context(7, "req_test_7", "openai_chat_completions", request, metadata,
+                                 prepared, /*llamacpp_log=*/false);
     const OperationalRecord pretty_start = render_request_start(context);
     failures += check(
         pretty_start.message ==

@@ -13,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
 
@@ -117,7 +118,24 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
         if (actual != expected) {
-            throw std::logic_error("materialized sequence does not match its active entitlement");
+            // Surface the per-field breakdown in the message: this is an invariant
+            // violation whose divergence field is the only clue to which plan-side
+            // estimate drifted, and the worker would otherwise lose it to a generic
+            // "fatal engine error" latch.
+            throw std::logic_error(
+                "materialized sequence does not match its active entitlement"
+                " (actual dev{lanes=" + std::to_string(actual.device.active_lanes) +
+                ",state=" + std::to_string(actual.device.state_slots) +
+                ",kv=" + std::to_string(actual.device.main_kv_pages) +
+                ",bkv=" + std::to_string(actual.device.backend_kv_pages) +
+                "} host{state=" + std::to_string(actual.host.state_slots) +
+                ",kv=" + std::to_string(actual.host.kv_bytes) +
+                "} vs expected dev{lanes=" + std::to_string(expected.device.active_lanes) +
+                ",state=" + std::to_string(expected.device.state_slots) +
+                ",kv=" + std::to_string(expected.device.main_kv_pages) +
+                ",bkv=" + std::to_string(expected.device.backend_kv_pages) +
+                "} host{state=" + std::to_string(expected.host.state_slots) +
+                ",kv=" + std::to_string(expected.host.kv_bytes) + "})");
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
