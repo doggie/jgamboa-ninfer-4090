@@ -584,11 +584,20 @@ public:
         std::optional<SelectedCapture> selected;
         std::vector<PlanningOwnerRecord> capture_owner_records;
         if (candidate.publishes_shared) {
+            // Mirrors the admissibility broadened in select_materialization_shared_captures:
+            // engine-detected structural boundaries must also be able to reach the eviction
+            // scenario search below (and the value fold inside CapturePlanner::plan), not just
+            // `declared`/`repeated` evidence, or they can never win a catalog that's already
+            // full no matter how much more valuable they are than the colder resident.
             const bool pressure_evidence =
                 has_shared_candidate_evidence(candidate.shared_evidence,
                                               SharedCandidateEvidence::ExplicitBoundary) ||
                 has_shared_candidate_evidence(candidate.shared_evidence,
                                               SharedCandidateEvidence::RequestedAutomatic) ||
+                has_shared_candidate_evidence(candidate.shared_evidence,
+                                              SharedCandidateEvidence::DefaultAutomatic) ||
+                has_shared_candidate_evidence(candidate.shared_evidence,
+                                              SharedCandidateEvidence::EngineStructural) ||
                 matching_reuse_domains(candidate.shortlist_key) >= 2U;
 
             std::vector<CaptureScenario> scenarios;
@@ -1795,13 +1804,21 @@ private:
                 has_shared_candidate_evidence(opportunity.evidence,
                                               SharedCandidateEvidence::RequestedAutomatic);
             const bool repeated = matching_reuse_domains(*key, provisional_demand) >= 2U;
-            const bool surplus_candidate =
-                vacant_shared_slots != 0 &&
-                (has_shared_candidate_evidence(opportunity.evidence,
-                                               SharedCandidateEvidence::DefaultAutomatic) ||
-                 has_shared_candidate_evidence(opportunity.evidence,
-                                               SharedCandidateEvidence::EngineStructural));
-            if (!declared && !repeated && !surplus_candidate) { continue; }
+            // Engine-detected structural boundaries (the system-prompt/tool-list edge) are the
+            // dominant real-world shared-prefix source, but under low-concurrency serving they
+            // rarely accumulate >=2 recently-matching domains. They used to be admissible only
+            // when a shared slot happened to already be vacant (`surplus_candidate` below), and
+            // were excluded from `pressure_capable`, so once the catalog filled up they could
+            // never win the value fold against an existing resident no matter how much more
+            // valuable they were. Treat them like `declared`/`repeated` candidates instead, and
+            // let the value fold (and the matching `pressure_evidence` check in
+            // reserve_active_capture) decide whether displacing a colder resident is worth it.
+            const bool structural =
+                has_shared_candidate_evidence(opportunity.evidence,
+                                              SharedCandidateEvidence::DefaultAutomatic) ||
+                has_shared_candidate_evidence(opportunity.evidence,
+                                              SharedCandidateEvidence::EngineStructural);
+            if (!declared && !repeated && !structural) { continue; }
             const std::optional<PrefillWork> rebuild =
                 base.shared_candidate_rebuild_work(opportunity.frontier);
             if (!rebuild) {
@@ -1813,7 +1830,7 @@ private:
                 .frontier         = opportunity.frontier,
                 .demand_mask      = demand_mask_for(*key, provisional_demand),
                 .rebuild_ns       = cost_model_.prefill_ns(*rebuild),
-                .pressure_capable = declared || repeated,
+                .pressure_capable = declared || repeated || structural,
             });
         }
 
