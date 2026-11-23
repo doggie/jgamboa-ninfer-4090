@@ -7,6 +7,7 @@
 #include "runtime/engine/context_cache/materialization_planner.h"
 #include "runtime/engine/context_cache/shared_capture_planner.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -3013,6 +3014,13 @@ private:
                 // The physical slot is already Free on an aborted transaction (start_request
                 // released it) and was published as the new active state on success; either way
                 // the consumed catalog entry is fully retired, not merely re-catalogued.
+                // On an aborted transaction nothing will republish this session, so its index
+                // cell is retired too. On success the cell is kept so publication_order still
+                // orders out-of-order finishes; if the active request later ends without
+                // republishing, the cell is stale and reclaimed by session_insert_cell.
+                if (result.status != ContextTransactionStatus::Published) {
+                    erase_session_if_owner(capability.owner.id);
+                }
                 clear_catalog_entry(source);
             }
         }
@@ -3334,7 +3342,8 @@ private:
         return std::nullopt;
     }
 
-    [[nodiscard]] std::size_t session_insert_cell(const CacheSessionKey& key) const {
+    [[nodiscard]] std::optional<std::size_t>
+    try_session_insert_cell(const CacheSessionKey& key) const {
         if (session_index_.empty()) {
             throw std::logic_error("session publication has no index capacity");
         }
@@ -3347,8 +3356,44 @@ private:
             if (entry.state == SessionIndexState::Deleted && !deleted) { deleted = cell; }
             if (entry.state == SessionIndexState::Empty) { return deleted.value_or(cell); }
         }
-        if (deleted) { return *deleted; }
-        throw std::logic_error("session index is full");
+        return deleted;
+    }
+
+    // A session cell is stale when the catalog entry it names no longer belongs to the owner
+    // recorded in the cell (slot cleared or reused). Such a binding can never be selected
+    // (see current_session_binding) and only occupies index capacity.
+    [[nodiscard]] bool session_cell_is_stale(const SessionIndexEntry& entry) const noexcept {
+        if (entry.state != SessionIndexState::Occupied) { return false; }
+        if (entry.slot >= catalog_count_) { return true; }
+        const CatalogEntry& owner = catalog_[entry.slot];
+        return owner.state == CatalogState::Vacant || owner.id != entry.owner_id;
+    }
+
+    std::size_t reclaim_stale_session_cells() noexcept {
+        std::size_t reclaimed = 0;
+        for (SessionIndexEntry& entry : session_index_) {
+            if (!session_cell_is_stale(entry)) { continue; }
+            entry.state             = SessionIndexState::Deleted;
+            entry.slot              = kInvalidCatalogSlot;
+            entry.owner_id          = 0;
+            entry.revision          = 0;
+            entry.publication_order = 0;
+            ++reclaimed;
+        }
+        stale_session_cells_reclaimed_ += reclaimed;
+        std::fprintf(stderr,
+                     "[ninfer] session index full: reclaimed %zu stale session cell(s) "
+                     "(total %llu, capacity %zu)\n",
+                     reclaimed, static_cast<unsigned long long>(stale_session_cells_reclaimed_),
+                     session_index_.size());
+        return reclaimed;
+    }
+
+    [[nodiscard]] std::size_t session_insert_cell(const CacheSessionKey& key) {
+        std::optional<std::size_t> cell = try_session_insert_cell(key);
+        if (!cell && reclaim_stale_session_cells() != 0) { cell = try_session_insert_cell(key); }
+        if (!cell) { throw std::logic_error("session index is full"); }
+        return *cell;
     }
 
     void erase_session_if_owner(std::uint64_t owner_id) noexcept {
@@ -3519,6 +3564,7 @@ private:
     std::vector<CatalogEntry> catalog_;
     std::vector<SharedCatalogEntry> shared_catalog_;
     std::vector<SessionIndexEntry> session_index_;
+    std::uint64_t stale_session_cells_reclaimed_ = 0;
     std::vector<PrefixIndexEntry> prefix_index_;
     std::vector<CheckpointObservation> observation_scratch_;
     std::vector<PrefixDemandRecord> demand_window_;

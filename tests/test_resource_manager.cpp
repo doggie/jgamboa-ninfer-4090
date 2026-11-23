@@ -3460,6 +3460,29 @@ void test_publication_only_pressure_constructs_adoptable_target() {
 
 } // namespace
 
+
+// Regression (2026-11-21, 50.26 brick): a session continuation consumed its catalogued source
+// (ConsumeToActive) and then terminated without republishing (abort). The consumed catalog
+// entry was cleared but its session-index cell stayed Occupied, so distinct sessions leaked
+// one cell each until publish_session threw "session index is full".
+void test_consumed_session_source_does_not_leak_session_index() {
+    constexpr std::uint32_t kCapacity = 3;
+    FakeManager manager = make_manager(1, kCapacity);
+    FakeProgram program;
+    for (std::uint32_t round = 0; round < 4 * kCapacity; ++round) {
+        const FakeCacheSessionKey session{100 + round};
+        const FakeRequestBasePlan base =
+            make_base(500 + round, session, RetentionClass::LiveSession, true);
+        const ActiveRequest seed = start_active(manager, program, 500 + round, base, 2 * round + 1);
+        (void)finish_active(manager, program, seed);
+        const ActiveRequest cont = start_active(manager, program, 500 + round, base, 2 * round + 2);
+        require(program.started_source_mode == PrivateSourceMode::ConsumeToActive,
+                "same-session continuation did not consume its source");
+        manager.mark_terminal_pending(cont.lane);
+        (void)manager.abort(program, cont.lane, cont.sequence);
+    }
+}
+
 int main() {
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
@@ -3492,6 +3515,8 @@ int main() {
              test_aborted_source_selection_does_not_create_hit_history);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
+    run_test("consumed session source does not leak session index",
+             test_consumed_session_source_does_not_leak_session_index);
     run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
     run_test("all preserving pressure alternatives",
              test_pressure_tries_every_preserving_alternative_before_eviction);
