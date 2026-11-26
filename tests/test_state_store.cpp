@@ -159,6 +159,12 @@ int main() {
     CUDA_CHECK(cudaMemset(recurrent1.data, 0x4d, recurrent1.bytes()));
     CUDA_CHECK(cudaMemset(conv1_layer1.data, 0x3c, conv1_layer1.bytes()));
     CUDA_CHECK(cudaMemset(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes()));
+    // The fills above run on the legacy default stream while copy_slot/zero_slot use the pool
+    // context's own non-blocking stream. Without an ordering point the first expect_device_byte
+    // (a cudaMemcpy on the legacy stream) can read slot 2 before the queued device-to-device
+    // copy has run, which fails intermittently depending on whether the stream is still backed
+    // by a thread-local default stream.
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     slotted.copy_slot(1, 2, ctx.stream);
     ctx.synchronize();
