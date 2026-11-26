@@ -10,6 +10,17 @@
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/slot_spill_guard.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <timeapi.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -247,6 +258,19 @@ public:
         writer_cv.wait(lock, [this] { return pending_writes.empty() && !write_in_flight; });
     }
 
+#ifdef _WIN32
+    // The scheduling loop polls with a 1 ms condition-variable timeout; the default 15.6 ms
+    // Windows timer stretches each poll to a full tick. Declared first so it covers startup
+    // and is released only after the core and device are gone.
+    struct WindowsTimerResolution {
+        WindowsTimerResolution() noexcept { ::timeBeginPeriod(1); }
+        ~WindowsTimerResolution() noexcept { ::timeEndPeriod(1); }
+        WindowsTimerResolution(const WindowsTimerResolution&)            = delete;
+        WindowsTimerResolution& operator=(const WindowsTimerResolution&) = delete;
+    };
+    WindowsTimerResolution timer_resolution;
+#endif
+
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
@@ -375,7 +399,8 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     return impl_->active->frontend.tokenize_text(text);
 }
 
-std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+CausalScore Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
+                                 CausalScoreCapture capture) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -390,18 +415,22 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     }
     PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
     const std::size_t expected = prompt.summary().prompt_tokens - first_target;
-    std::vector<float> result  = std::visit(
-        [&](auto& core) -> std::vector<float> {
+    CausalScore result         = std::visit(
+        [&](auto& core) -> CausalScore {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
-                return core->score(std::move(prompt.impl_->value), first_target);
+                return core->score(std::move(prompt.impl_->value), first_target, capture);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
             }
         },
         impl_->core);
-    if (result.size() != expected) {
-        throw std::logic_error("target Program returned an invalid causal score count");
+    if (result.logprobs.size() != expected ||
+        (capture.argmax ? result.argmax.size() != expected : !result.argmax.empty()) ||
+        (capture.hidden
+             ? result.hidden_size == 0 || result.hidden.size() != expected * result.hidden_size
+             : !result.hidden.empty())) {
+        throw std::logic_error("target Program returned an invalid causal score shape");
     }
     return result;
 }

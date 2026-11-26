@@ -98,6 +98,28 @@ explicit specialization, so linking `ninfer.exe` failed with 4 unresolved extern
 body (`impl_ = std::move(other.impl_); return *this;`), which MSVC emits normally. GCC/Clang
 accepted the `= default` form, so this is MSVC-specific and Linux is unaffected.
 
+### 5. Timer resolution for the engine's 1 ms poll
+
+The engine's scheduling loop waits on a condition variable with a 1 ms timeout. Windows rounds
+that wait up to the system timer tick, 15.6 ms by default, so a request that polls (admission,
+context transactions) pays whole ticks. `Engine::Impl` (`src/runtime/engine/engine.cpp`) holds
+a `timeBeginPeriod(1)` / `timeEndPeriod(1)` guard for its whole lifetime (linked with `winmm`),
+so the CLI, the server and perplexity all get it. Adapted from headpiece747/ninfer-5090-windows
+(`63650cc6`, `c323ff3d`).
+
+Measured 2026-11-04 on the RTX 4090 (Bonsai, MTP 3, `ninfer-serve`, 30 sequential 8-token
+requests per run, runs alternated with the 2026.11.03 release binary; server `total` from
+`--request-log-jsonl`):
+
+| | Before | After |
+|---|---:|---:|
+| Request total, median | 57.5-58.4 ms | 57.3-59.6 ms |
+| Request total, mean | 65.2-65.7 ms | 61.2-61.7 ms |
+| Request total, p90 | 78.2-90.0 ms | 73.2-73.9 ms |
+| TTFT with a reused 3.9K-token system prefix | 120-123 ms | 73-82 ms |
+
+The median is unchanged; the poll mostly cost tail latency and requests that poll several times.
+
 ---
 
 ## Building on Windows
@@ -1384,3 +1406,166 @@ and 3, Qwen3.8 MTP 3, with and without n-gram), every needle answer exact. Measu
 | Qwen3.8 A8 MTP 3, six prompts | 118.2 / 118.2 tok/s | 118.5 / 118.4 tok/s |
 | Qwen3.8 A8 `pp2048` | 5,745 / 5,713 tok/s | 5,825 / 5,891 tok/s |
 | Qwen3.8 A8 `long_niah_64k` | 15.1 / 15.1 s | 14.9 / 14.9 s |
+
+## Qwen3.8 decode profile and a Q4/Q5 MTP layer (2026-10-11)
+
+Profile (measured, nsys, `profiles/nsys/qwen38_a8_mtp3_{code,story}`): `qwen3_8_27b_a8.ninfer`,
+rk4v4-e8, MTP 3 with `--lm-head-draft`, greedy, thinking off, 512 tokens, build `e905787f`, 4090
+headless. Plain runs: code prompt 147.7 tok/s (78.2 % acceptance, 3.34 tokens per round), story
+95.2 tok/s (38.8 %, 2.16). Both run 23.2 ms per round with the GPU busy 22.4 ms (96.5 %):
+
+| Kernel family (per round) | ms | Bytes read | GB/s |
+|---|---:|---:|---:|
+| Q4 MLP gate+up, K-split MMA (64 x 110.7 us) | 7.08 | 6.06 GB | 856 |
+| Q5 MLP down + o_proj/out_proj, split2 (128 calls) | 6.11 | 5.06 GB | 829 |
+| GDN input projection, Q5 split4 + Q4 SIMT (48 + 48) | 3.03 | 2.51 GB | 830 |
+| Attention input projection, Q5 split4 + Q4 SIMT (16 + 16) | 0.89 | 0.70 GB | 783 |
+| Q8 output head for verification (1 x 1.43 ms) | 1.43 | 1.31 GB | 917 |
+| Q8 MTP layer, three drafts (15 calls) | 1.49 | 1.31 GB | 880 |
+| Q4 proposal head, three drafts (3 x 376 us) | 1.13 | 1.07 GB | 948 |
+| GDN recurrence, attention, norms and the rest | 1.3 | | |
+
+Every weight stream runs at 783-948 GB/s against the ~845 GB/s sequential ceiling measured on
+this card, so the round is bandwidth bound: ~18 GB of weights per round. The kernels have little
+left; the remaining lever is the bytes. The draft side (MTP layer and proposal head) reads 2.4 GB
+of the 18 GB, and the MTP layer was still Q8 although Bonsai showed in September that a Q4/Q5 MTP
+layer keeps its acceptance (Bonsai design notes, section 9.1, item 11).
+
+New recipe `qwen3_8_27b_a8_mtp_q4q5` (`tools/convert/official_recipes.py`): `qwen3_8_27b_a8`
+with the MTP layer's projections requantized to the Q4/Q5 mix from the reference's decoded values
+(`mtp/input_projection` stays Q8). Converted from the A8 artifact in 147 s on CUDA; 20,259,427,584
+bytes against 20,437,521,664:
+
+```powershell
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\bonsai2-27b-vl --recipe qwen3_8_27b_a8_mtp_q4q5 `
+  --source reference=E:\LLM\qwen3_8_27b_a8.ninfer --source dflash2=E:\LLM\dflash2-src `
+  --components text,vision,mtp,dflash2 --name qwen3.8-27b --device cuda `
+  --out E:\LLM\qwen3_8_27b_a8_mtpq4q5.ninfer
+```
+
+Six prompts, MTP 3, `--lm-head-draft`, rk4v4-e8, greedy, thinking off, 512 tokens, order base,
+new, new, base:
+
+| Artifact | Decode | ms per round | Acceptance | Tokens per round |
+|---|---:|---:|---:|---:|
+| Q8 MTP layer (base) | 117.1 / 116.9 tok/s | 22.774 / 22.813 | 55.4 % | 2.666 |
+| Q4/Q5 MTP layer | **121.0 / 120.9 tok/s** | **22.191 / 22.203** | 56.1 % | 2.685 |
+
+- +3.3 % decode; the round is 0.60 ms shorter (the estimate from the bytes was ~0.6 ms) and
+  acceptance does not fall.
+- Greedy text matches on two of the six prompts; the other four diverge early at near-ties
+  ("Merges" / "Merge"). The base artifact alone also changes its greedy text between MTP 3,
+  MTP 2 and no speculation on the same prompts, so this is the verification-order sensitivity
+  already noted for Bonsai's draft window, not a change in the main model.
+- `tests/convert/test_qwen_mtp_recipe.py` checks the requantization against the reference's
+  decoded values and that every other parameter is copied word for word.
+
+## Qwen3.6-27B (2026-10-11)
+
+`Qwen/Qwen3.6-27B` (revision `6a9e13bd`, Apache 2.0, the same architecture and MTP layout as
+Qwen3.8) converted from BF16 with the new `qwen3_6_27b_a8_mtp_q4q5` recipe: the official
+`qwen3_6_27b` representation (Q4/Q5 layers, Q6 embedding and output head; upstream measured
+AIME 2026 93.3 % and GPQA-Diamond 86.9 % with it on the RTX 5090), `AllowA8` prefill, and the
+MTP layer in the Q4/Q5 mix. No DFlash2 (its drafter is trained for Qwen3.8). 119 s on CUDA,
+17,317,444,864 bytes, 15.8 GiB of weights on the GPU:
+
+```powershell
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\qwen36-src --recipe qwen3_6_27b_a8_mtp_q4q5 `
+  --components text,vision,mtp --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja `
+  --proposal --name qwen3.6-27b --device cuda --out E:\LLM\qwen3_6_27b_a8_mtpq4q5.ninfer
+```
+
+Against `qwen3_8_27b_a8_mtpq4q5.ninfer` on the same binary (`62875ced`), RTX 4090 headless:
+
+| Measurement | Qwen3.6 | Qwen3.8 |
+|---|---:|---:|
+| Decode, six prompts, MTP 3, greedy, thinking off (q36, q38, q38, q36) | **125.8 / 125.7 tok/s** | 120.9 / 120.9 tok/s |
+| MTP acceptance / tokens per round | 58.3 % / 2.757 | 56.1 % / 2.685 |
+| `long_niah_8k` / `long_niah_64k` prefill (rk4v4-e8, chunk 1024) | 1.4 / 14.9 s, exact | 1.4 / 14.7 s, exact |
+| Quick perplexity, bf16 KV | 7.1294 | 4.7944 |
+| `tools.eval`, 45 tasks, thinking off | 43/45 | 44/45 |
+| Six hard problems, thinking on, sampled, 3 seeds, up to 20,000 tokens | 14/18, 204,307 tokens | 18/18, 62,059 tokens |
+
+- Perplexity by domain (Qwen3.6 / Qwen3.8): Chinese reference 26.51 / 6.78, English long form
+  6.80 / 7.18, English reference 7.63 / 6.43, NInfer code 1.85 / 1.67. Only the Chinese
+  reference domain is far apart, and Qwen3.6 is better on English long form, so the gap is a
+  model difference (most likely Qwen3.8 having seen that reference text), not a uniform
+  quantization loss.
+- `tools.eval`: both fail `json.order_total`; Qwen3.6 also fails `code.lru_cache`. Tool
+  calling, JSON, math, Spanish and the 4K-32K needles pass on both.
+- Hard problems (the Swift 1.5 protocol): Qwen3.6 thinks 3.3x longer; five runs hit the
+  20,000-token limit (all three `pairs` runs and two `mod7` runs; one `mod7` answer was already
+  in the reasoning). Decode with thinking ran at 149.7 tok/s. Mean tokens per problem
+  (Qwen3.6 / Qwen3.8): AIME #1 12,008 / 1,318, probability 6,916 / 1,177, pairs 20,000 (limit) /
+  11,600, zebra 3,376 / 2,916, mod 7 18,683 / 1,627, clock 7,119 / 2,047.
+- Qwen3.6 is the faster model per token and matches Qwen3.8 without thinking; with thinking it
+  spends several times more tokens per answer, so Qwen3.8 stays the default.
+## Q5 small-T tensor-core kernel from ninfer-all (2026-11-16)
+
+Ported `q5_small_t_mma` (iamwavecut/ninfer-all, Apache-2.0) as `src/ops/linear/q5/q5_small_t_mma.cuh`
+plus `src/ops/common/small_t_split_store.cuh`. 16 rows x 8 K-warps per CTA, cp.async staging, a
+permuted k order so the A fragment is one 64-bit load of Q5 codes decoded with magic-number bit
+tricks, bf16 m16n8k16 `mma.sync`, per-64-group fp16 scale folded with fmaf. XCols in {4,8,16}.
+
+Routes: linear_add Q5 T=4..16 (T=1..3 stays exact SIMT split2); attn/GDN input projections
+T=7..16 (T<=6 stays split4_exact: the Q4 SIMT side dominates there, so extending Q5 does nothing).
+Removed `q5_ksplit_mma.cuh`, `q5_rowsplit_rowblock_small_t.cuh` and the old linear_add ksplit file.
+
+Qualification: linear_add/attn/GDN oracle tests pass over the T ranges and route boundaries; a
+deliberately broken decode constant fails all three (mutation check).
+
+End to end (RTX 4090, Qwen3.8-27B a8 mtpq4q5, greedy, 8192 ctx, rk4v4-e8, original vs new binary
+alternated): DFlash2 K=7 +12..20 %, K=11 +11..13 %, K=15 +11..14 %, K=5 +3..8 %; MTP3 and
+MTP3+ngram unchanged within noise (the doc+ngram cell moved 391 -> 446 tok/s). Greedy outputs
+are identical on most cells; some diverge late because bf16 accumulation order changed, with
+tokens/round unchanged within noise.
+
+Harness pitfall: a memset-based L2 flush leaves dirty lines and understates kernel differences;
+use a read-only flush kernel to match in-situ nsys numbers.
+
+## Q4 parents on tensor cores at T=5/6 (2026-11-16)
+
+DFlash2 K=4/K=5 verification (T=5/6) still ran the Q4 parents of the attention and GDN input
+projections on the row-split SIMT tile: a K=5 round (29.6 ms) cost more than a K=7 one (28.0 ms).
+attn and the GDN independent route now send T=5/6 to the K-split tensor-core Q4 kernel on its
+eight-column tile, and the GDN projection+conv op (fused epilogue kernel, SIMT inside) now
+materializes from T=4, so T=5/6 reach the same kernel. Whole-op, RTX 4090, cold L2:
+attn 110 / 118 -> 77 / 80 us, GDN independent 105 / 112 -> 91 / 94 us, GDN projection+conv
+102 / 115 -> 90 / 94 us. The Q5 parent gains nothing from the small-T kernel at T=5/6 once Q4 is
+fixed (within 3 us), so it keeps its split4 SIMT form. Capacity of the snapshot workspace and its
+interval test follow the new boundary (T=1..3 fused, T>=4 materialized).
+
+End to end (greedy, 27B a8 mtpq4q5, previous binary vs new, alternated): DFlash2 K=5 +3..7 %
+(code/doc/py), K=4 +5 % on code/doc/py, K=3/K=6 unchanged. Run-to-run drift on this box reaches
+several percent (an unchanged K=7 cell moved -9 % once), so single cells under ~5 % are noise.
+
+## DFlash2 + n-gram copy overlay: measured, not kept (2026-11-16)
+
+Prototype: a host n-gram pool match of at least `--ngram-min` tokens overwrote the first drafts of
+a DFlash2 round (device op writing the copy as a one-hot sparse proposal: `drafts`,
+`candidate_ids`, `proposal_q`), at unchanged width, graphs and memory. Exact oracle test for the
+op; greedy output identical to plain DFlash2 in 23 of 24 cells.
+
+Offline replay (`tools/spec_sim`, `replace:` policy, five agent transcripts, `--draft-min 4`):
++31 % at 0.5 per-position drafter acceptance, +15 % at 0.75, about 0 at 0.92.
+
+Measured on this 4090, Qwen3.8-27B a8 greedy: -1..-12 % (doc K=15 13.5 -> 12.0 tokens per round),
+because copies replace correct neural drafts or shorten the proposal. Bonsai + ProCreations head,
+server (thinking, T=1.0, 3 lanes, 100K, 2 seeds), aggregate tok/s: MTP3+ngram 237, DFlash2 K=7
+255 -> 256 with copy (`--ngram-n 12 --ngram-min 6`), K=15 221 -> 218. Per prompt the copy helps
+where text is copied (long_py K=7 327 -> 408, K=15 352 -> 535) and costs where it is not
+(agent_doc K=7 467 -> 443, long_cpp K=15 345 -> 305), so the aggregate does not move.
+
+Dropped: no clear win over MTP3+ngram or DFlash2 K=7. A gate that knew the neural draft's
+confidence (device side) would be the next thing to try; the prototype diff is not kept in the tree.
+
+### DFlash2 code prompt, README protocol, before and after (2026-11-16)
+
+`ninfer-serve --kv-dtype rk4v4-e8 --spec dflash2 --draft-tokens K --lm-head-draft`, the
+quicksort/mergesort request (thinking off, temperature 0, 500 tokens), `qwen3_8_27b_a8_mtpq4q5`,
+original binary of 2026-11-04 against the rebuilt tree (Q5 small-T and Q4 T=5/6 kernels),
+alternated over three server starts of three requests each, run-to-run spread under 1 %:
+K=12 352.2 -> 402.5 tok/s (+14 %, 10.72 tokens per round in both); K=6 234.5 -> 256.1 tok/s
+(+9 %, 6.62 -> 6.35 tokens per round: the greedy text diverges slightly under the new kernels'
+accumulation order, +14 % per round). README rows updated from the 211 tok/s of 2026-09-21; that
+number was already stale: the original binary measures 352 tok/s today.
