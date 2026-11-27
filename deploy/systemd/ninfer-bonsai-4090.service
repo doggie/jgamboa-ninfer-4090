@@ -6,7 +6,7 @@ After=network.target
 User=emi
 WorkingDirectory=/home/emi/code/jgamboa-ninfer-4090
 ExecStart=/home/emi/code/jgamboa-ninfer-4090/build/apps/ninfer-serve \
-    /home/emi/model/tensorninja-4090/models/bonsai2_27b_vl_mtp_q4q5.ninfer \
+    /home/emi/model/tensorninja-4090/models/bonsai25_27b_vl_mtp_q4q5.ninfer \
     --host 0.0.0.0 --port 8080 \
     --max-context 262144 \
     --kv-capacity auto \
